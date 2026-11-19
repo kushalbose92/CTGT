@@ -1,1 +1,1 @@
-# CTGT
+# Commute Time Graph Transformer (CTGT)
