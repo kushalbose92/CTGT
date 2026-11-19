@@ -8,7 +8,7 @@ import math
 
 from train.metrics import MAE
 
-def train_epoch(model, optimizer, device, data_loader, epoch):
+def train_epoch(model, optimizer, device, data_loader, net_params):
     model.train()
     epoch_loss = 0
     epoch_train_mae = 0
@@ -20,20 +20,17 @@ def train_epoch(model, optimizer, device, data_loader, epoch):
         batch_e = batch_graphs.edata['feat'].to(device)
         batch_targets = batch_targets.to(device)
         optimizer.zero_grad()
-        try:
+        
+        if net_params['lap_pos_enc'] is True:
             batch_lap_pos_enc = batch_graphs.ndata['lap_pos_enc'].to(device)
             sign_flip = torch.rand(batch_lap_pos_enc.size(1)).to(device)
             sign_flip[sign_flip>=0.5] = 1.0; sign_flip[sign_flip<0.5] = -1.0
             batch_lap_pos_enc = batch_lap_pos_enc * sign_flip.unsqueeze(0)
-        except:
-            batch_lap_pos_enc = None
-            
-        try:
-            batch_wl_pos_enc = batch_graphs.ndata['wl_pos_enc'].to(device)
-        except:
-            batch_wl_pos_enc = None
+            # batch_lap_pos_enc_er = batch_graphs.edata['ER'].to(device)
+        else:
+            batch_lap_pos_enc = batch_graphs.edata['rw_pos_enc'].to(device)
 
-        batch_scores = model.forward(batch_graphs, batch_x, batch_e, batch_lap_pos_enc, batch_wl_pos_enc)
+        batch_scores = model.forward(batch_graphs, batch_x, batch_e, batch_lap_pos_enc)
         loss = model.loss(batch_scores, batch_targets)
         loss.backward()
         optimizer.step()
@@ -45,7 +42,9 @@ def train_epoch(model, optimizer, device, data_loader, epoch):
     
     return epoch_loss, epoch_train_mae, optimizer
 
-def evaluate_network(model, device, data_loader, epoch):
+
+
+def evaluate_network(model, device, data_loader, net_params):
     model.eval()
     epoch_test_loss = 0
     epoch_test_mae = 0
@@ -56,17 +55,13 @@ def evaluate_network(model, device, data_loader, epoch):
             batch_x = batch_graphs.ndata['feat'].to(device)
             batch_e = batch_graphs.edata['feat'].to(device)
             batch_targets = batch_targets.to(device)
-            try:
+
+            if net_params['lap_pos_enc'] is True:
                 batch_lap_pos_enc = batch_graphs.ndata['lap_pos_enc'].to(device)
-            except:
-                batch_lap_pos_enc = None
-            
-            try:
-                batch_wl_pos_enc = batch_graphs.ndata['wl_pos_enc'].to(device)
-            except:
-                batch_wl_pos_enc = None
-                
-            batch_scores = model.forward(batch_graphs, batch_x, batch_e, batch_lap_pos_enc, batch_wl_pos_enc)
+            else:
+                batch_lap_pos_enc = batch_graphs.edata['rw_pos_enc'].to(device)
+
+            batch_scores = model.forward(batch_graphs, batch_x, batch_e, batch_lap_pos_enc)
             loss = model.loss(batch_scores, batch_targets)
             epoch_test_loss += loss.detach().item()
             epoch_test_mae += MAE(batch_scores, batch_targets)

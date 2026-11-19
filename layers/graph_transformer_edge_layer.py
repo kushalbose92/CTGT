@@ -6,6 +6,10 @@ import dgl
 import dgl.function as fn
 import numpy as np
 
+import sys
+import os
+
+
 """
     Graph Transformer Layer with edge features
     
@@ -17,6 +21,16 @@ import numpy as np
 def src_dot_dst(src_field, dst_field, out_field):
     def func(edges):
         return {out_field: (edges.src[src_field] * edges.dst[dst_field])}
+    return func
+
+def src_dot_src(src_field, out_field):
+    def func(edges):
+        return {out_field: (edges.src[src_field] * edges.src[src_field])}
+    return func
+
+def dst_dot_dst(dst_field, out_field):
+    def func(edges):
+        return {out_field: (edges.dst[dst_field] * edges.dst[dst_field])}
     return func
 
 def scaling(field, scale_constant):
@@ -72,13 +86,27 @@ class MultiHeadAttentionLayer(nn.Module):
             self.V = nn.Linear(in_dim, out_dim * num_heads, bias=False)
             self.proj_e = nn.Linear(in_dim, out_dim * num_heads, bias=False)
     
-    def propagate_attention(self, g):
+    def propagate_attention(self, g, pos_enc, ctgt_flag):
         # Compute attention score
-        g.apply_edges(src_dot_dst('K_h', 'Q_h', 'score')) #, edges)
+        if ctgt_flag == 'True':
+            g.apply_edges(src_dot_dst('K_h', 'Q_h', 'score0')) #, edges)
+            g.apply_edges(src_dot_dst('Q_h', 'K_h', 'score1')) #, edges)
+            g.apply_edges(src_dot_src('Q_h', 'score2'))
+            g.apply_edges(dst_dot_dst('K_h', 'score3'))
+            Z = g.edata['score2'] + g.edata['score3']
+            g.edata['score'] = g.edata['score0'] + g.edata['score1'] - Z
+        else:
+            g.apply_edges(src_dot_dst('K_h', 'Q_h', 'score')) #, edges)
+        # print("attention scores:  ", g.edata['score'].shape)
+
+        # Adding Effective Resistance as relattive posiitonal encodngs
+        # pos_enc = pos_enc.view(g.edata['score'].shape[0], 1, 1).expand(g.edata['score'].shape[0], g.edata['score'].shape[1], g.edata['score'].shape[2])
+        # print(g.edata['score'].shape, "   ", pos_enc.shape)
+        # g.edata['score'] -= pos_enc
         
         # scaling
         g.apply_edges(scaling('score', np.sqrt(self.out_dim)))
-        
+    
         # Use available edge features to modify the scores
         g.apply_edges(imp_exp_attn('score', 'proj_e'))
         
@@ -90,16 +118,27 @@ class MultiHeadAttentionLayer(nn.Module):
 
         # Send weighted values to target nodes
         eids = g.edges()
-        g.send_and_recv(eids, fn.src_mul_edge('V_h', 'score', 'V_h'), fn.sum('V_h', 'wV'))
-        g.send_and_recv(eids, fn.copy_edge('score', 'score'), fn.sum('score', 'z'))
+        g.send_and_recv(eids, fn.u_mul_e('V_h', 'score', 'V_h'), fn.sum('V_h', 'wV'))
+        g.send_and_recv(eids, fn.copy_e('score', 'score'), fn.sum('score', 'z'))
+
+        attn_scores = g.edata['score']
+        print("attention scores:  ", attn_scores.shape)
+
+        return g.edata['score']
     
-    def forward(self, g, h, e):
+    def forward(self, g, h, e, pos_enc, ctgt_flag):
         
         Q_h = self.Q(h)
         K_h = self.K(h)
         V_h = self.V(h)
         proj_e = self.proj_e(e)
-        
+
+        if ctgt_flag == 'True':
+        # adding PEs into Q, K, and V
+            Q_h += pos_enc
+            K_h += pos_enc
+            V_h += pos_enc
+
         # Reshaping into [num_nodes, num_heads, feat_dim] to 
         # get projections for multi-head attention
         g.ndata['Q_h'] = Q_h.view(-1, self.num_heads, self.out_dim)
@@ -107,13 +146,13 @@ class MultiHeadAttentionLayer(nn.Module):
         g.ndata['V_h'] = V_h.view(-1, self.num_heads, self.out_dim)
         g.edata['proj_e'] = proj_e.view(-1, self.num_heads, self.out_dim)
         
-        self.propagate_attention(g)
+        attn_scores = self.propagate_attention(g, pos_enc, ctgt_flag)
         
         h_out = g.ndata['wV'] / (g.ndata['z'] + torch.full_like(g.ndata['z'], 1e-6)) # adding eps to all values here
         e_out = g.edata['e_out']
         
-        return h_out, e_out
-    
+        return h_out, e_out, attn_scores
+
 
 class GraphTransformerLayer(nn.Module):
     """
@@ -159,12 +198,12 @@ class GraphTransformerLayer(nn.Module):
             self.batch_norm2_h = nn.BatchNorm1d(out_dim)
             self.batch_norm2_e = nn.BatchNorm1d(out_dim)
         
-    def forward(self, g, h, e):
+    def forward(self, g, h, e, node_pos, ctgt_flag):
         h_in1 = h # for first residual connection
         e_in1 = e # for first residual connection
         
         # multi-head attention out
-        h_attn_out, e_attn_out = self.attention(g, h, e)
+        h_attn_out, e_attn_out, attn_scores = self.attention(g, h, e, node_pos, ctgt_flag)
         
         h = h_attn_out.view(-1, self.out_channels)
         e = e_attn_out.view(-1, self.out_channels)
@@ -214,7 +253,7 @@ class GraphTransformerLayer(nn.Module):
             h = self.batch_norm2_h(h)
             e = self.batch_norm2_e(e)             
 
-        return h, e
+        return h, e, attn_scores
         
     def __repr__(self):
         return '{}(in_channels={}, out_channels={}, heads={}, residual={})'.format(self.__class__.__name__,

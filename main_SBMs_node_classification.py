@@ -34,9 +34,6 @@ class DotDict(dict):
 from nets.SBMs_node_classification.load_net import gnn_model 
 from data.data import LoadData 
 
-
-
-
 """
     GPU Setup
 """
@@ -51,14 +48,6 @@ def gpu_setup(use_gpu, gpu_id):
         print('cuda not available')
         device = torch.device("cpu")
     return device
-
-
-
-
-
-
-
-
 
 
 """
@@ -90,20 +79,30 @@ def train_val_pipeline(MODEL_NAME, dataset, params, net_params, dirs):
     if net_params['lap_pos_enc']:
         st = time.time()
         print("[!] Adding Laplacian positional encoding.")
-        dataset._add_laplacian_positional_encodings(net_params['pos_enc_dim'])
+        dataset._add_laplacian_positional_encodings(net_params['pos_enc_dim'], net_params['ctgt_flag'])
+        # dataset._add_node_ordering()
         print('Time LapPE:',time.time()-st)
         
-    if net_params['wl_pos_enc']:
-        st = time.time()
-        print("[!] Adding WL positional encoding.")
-        dataset._add_wl_positional_encodings()
-        print('Time WL PE:',time.time()-st)
-    
-    if net_params['full_graph']:
+    if net_params['full_graph'] == 'True':
         st = time.time()
         print("[!] Converting the given graphs to full graphs..")
         dataset._make_full_graph()
         print('Time taken to convert to full graphs:',time.time()-st)
+    
+    if net_params['eff_res']:
+        st = time.time()
+        print("[!] Computing Effective Resistance.")
+        dataset._add_effective_resistance()
+        # dataset._add_node_ordering()
+        print('Time ER:',time.time()-st)
+
+    if net_params['rw_pos_enc']:
+        st = time.time()
+        print("[!] Adding Random Walk positional encoding.")
+        dataset._add_rand_walk_positional_encodings(net_params['pos_enc_dim'])
+        print('Time WL PE:',time.time()-st)
+        
+    # print("{} || {} || {}".format(net_params['pe_layers'], net_params['manifold'], net_params['model']))
         
     trainset, valset, testset = dataset.train, dataset.val, dataset.test
         
@@ -112,7 +111,7 @@ def train_val_pipeline(MODEL_NAME, dataset, params, net_params, dirs):
     
     # Write network and optimization hyper-parameters in folder config/
     with open(write_config_file + '.txt', 'w') as f:
-        f.write("""Dataset: {},\nModel: {}\n\nparams={}\n\nnet_params={}\n\n\nTotal Parameters: {}\n\n"""                .format(DATASET_NAME, MODEL_NAME, params, net_params, net_params['total_param']))
+        f.write("""Dataset: {},\nModel: {}\n\nparams={}\n\nnet_params={}\n\n\nTotal Parameters: {}\n\n""".format(DATASET_NAME, MODEL_NAME, params, net_params, net_params['total_param']))
         
     log_dir = os.path.join(root_log_dir, "RUN_" + str(0))
     writer = SummaryWriter(log_dir=log_dir)
@@ -123,6 +122,10 @@ def train_val_pipeline(MODEL_NAME, dataset, params, net_params, dirs):
     torch.manual_seed(params['seed'])
     if device.type == 'cuda':
         torch.cuda.manual_seed(params['seed'])
+        torch.cuda.manual_seed_all(params['seed'])
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        
     
     print("Training Graphs: ", len(trainset))
     print("Validation Graphs: ", len(valset))
@@ -135,11 +138,10 @@ def train_val_pipeline(MODEL_NAME, dataset, params, net_params, dirs):
     optimizer = optim.Adam(model.parameters(), lr=params['init_lr'], weight_decay=params['weight_decay'])
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',
                                                      factor=params['lr_reduce_factor'],
-                                                     patience=params['lr_schedule_patience'],
-                                                     verbose=True)
+                                                     patience=params['lr_schedule_patience'])
     
     epoch_train_losses, epoch_val_losses = [], []
-    epoch_train_accs, epoch_val_accs = [], [] 
+    epoch_train_accs, epoch_val_accs, epoch_test_accs = [], [], [] 
     
     # import train and evaluate functions
     from train.train_SBMs_node_classification import train_epoch, evaluate_network 
@@ -157,15 +159,17 @@ def train_val_pipeline(MODEL_NAME, dataset, params, net_params, dirs):
 
                 start = time.time()
 
-                epoch_train_loss, epoch_train_acc, optimizer = train_epoch(model, optimizer, device, train_loader, epoch)
+                epoch_train_loss, epoch_train_acc, optimizer = train_epoch(model, optimizer, device, train_loader, net_params)
                     
-                epoch_val_loss, epoch_val_acc = evaluate_network(model, device, val_loader, epoch)
-                _, epoch_test_acc = evaluate_network(model, device, test_loader, epoch)        
+                epoch_val_loss, epoch_val_acc = evaluate_network(model, device, val_loader, net_params)
+                _, epoch_test_acc = evaluate_network(model, device, test_loader, net_params)        
                 
                 epoch_train_losses.append(epoch_train_loss)
                 epoch_val_losses.append(epoch_val_loss)
                 epoch_train_accs.append(epoch_train_acc)
                 epoch_val_accs.append(epoch_val_acc)
+
+                epoch_test_accs.append(epoch_test_acc)
 
                 writer.add_scalar('train/_loss', epoch_train_loss, epoch)
                 writer.add_scalar('val/_loss', epoch_val_loss, epoch)
@@ -210,11 +214,24 @@ def train_val_pipeline(MODEL_NAME, dataset, params, net_params, dirs):
         print('-' * 89)
         print('Exiting from training early because of KeyboardInterrupt')
     
-    
-    _, test_acc = evaluate_network(model, device, test_loader, epoch)
-    _, train_acc = evaluate_network(model, device, train_loader, epoch)
-    print("Test Accuracy: {:.4f}".format(test_acc))
-    print("Train Accuracy: {:.4f}".format(train_acc))
+    test_acc_list = []
+    train_acc_list = []
+    test_loader_new = DataLoader(testset, batch_size=params['batch_size'], shuffle=True, collate_fn=dataset.collate)
+    for _ in range(10):
+        _, test_acc = evaluate_network(model, device, test_loader_new, net_params)
+        _, train_acc = evaluate_network(model, device, train_loader, net_params)
+        test_acc_list.append(test_acc)
+        train_acc_list.append(train_acc)
+
+    # index = epoch_val_accs.index(max(epoch_val_accs))
+
+    # test_acc = epoch_test_accs[index]
+    # train_acc = epoch_train_accs[index]
+
+    print("Test Accuracy Stats: {:.4f} || {:.4f}".format(np.mean(test_acc_list), np.std(test_acc_list)))
+    print("Train Accuracy Stats: {:.4f} || {:.4f}".format(np.mean(train_acc_list), np.std(train_acc_list)))
+    # print("Test Accuracy: {:.4f}".format(test_acc))
+    # print("Train Accuracy: {:.4f}".format(train_acc))
     print("Convergence Time (Epochs): {:.4f}".format(epoch))
     print("TOTAL TIME TAKEN: {:.4f}s".format(time.time()-start0))
     print("AVG TIME PER EPOCH: {:.4f}s".format(np.mean(per_epoch_time)))
@@ -273,7 +290,17 @@ def main():
     parser.add_argument('--pos_enc_dim', help="Please give a value for pos_enc_dim")
     parser.add_argument('--lap_pos_enc', help="Please give a value for lap_pos_enc")
     parser.add_argument('--wl_pos_enc', help="Please give a value for wl_pos_enc")
+    parser.add_argument('--rw_pos_enc', help="Please give a value for rw_pos_enc")
+    parser.add_argument('--full_graph', help="Whether to convert to full graphs")
+    parser.add_argument('--ctgt_flag', help="Whether to activate CTGT")
+    
     args = parser.parse_args()
+    rand_seed = args.seed 
+    full_graph = args.full_graph
+    ctgt_flag = args.ctgt_flag
+    print(rand_seed, "  ", full_graph, "  ", ctgt_flag)
+    
+    args.config = 'configs/' + args.config
     with open(args.config) as f:
         config = json.load(f)
         
@@ -298,8 +325,9 @@ def main():
         out_dir = config['out_dir']
     # parameters
     params = config['params']
-    if args.seed is not None:
-        params['seed'] = int(args.seed)
+    params['seed'] = int(rand_seed)
+    # if args.seed is not None:
+    #     params['seed'] = int(args.seed)
     if args.epochs is not None:
         params['epochs'] = int(args.epochs)
     if args.batch_size is not None:
@@ -320,6 +348,8 @@ def main():
         params['max_time'] = float(args.max_time)
     # network parameters
     net_params = config['net_params']
+    net_params['full_graph'] = full_graph
+    net_params['ctgt_flag'] = ctgt_flag
     net_params['device'] = device
     net_params['gpu_id'] = config['gpu']['id']
     net_params['batch_size'] = params['batch_size']
@@ -347,12 +377,14 @@ def main():
         net_params['batch_norm'] = True if args.batch_norm=='True' else False
     if args.self_loop is not None:
         net_params['self_loop'] = True if args.self_loop=='True' else False
-    if args.lap_pos_enc is not None:
-        net_params['lap_pos_enc'] = True if args.pos_enc=='True' else False
     if args.pos_enc_dim is not None:
         net_params['pos_enc_dim'] = int(args.pos_enc_dim)
+    if args.lap_pos_enc is not None:
+        net_params['lap_pos_enc'] = True if args.pos_enc=='True' else False
     if args.wl_pos_enc is not None:
-        net_params['wl_pos_enc'] = True if args.pos_enc=='True' else False
+        net_params['wl_pos_enc'] = True if args.wl_pos_enc=='True' else False
+    if args.rw_pos_enc is not None:
+        net_params['rw_pos_enc'] = True if args.rw_pos_enc=='True' else False
         
     # SBM
     net_params['in_dim'] = torch.unique(dataset.train[0][0].ndata['feat'],dim=0).size(0) # node_dim (feat is an integer)
@@ -374,36 +406,6 @@ def main():
     net_params['total_param'] = view_model_param(MODEL_NAME, net_params)
     train_val_pipeline(MODEL_NAME, dataset, params, net_params, dirs)
 
-    
-    
-    
-    
-    
-    
+     
 main()    
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 

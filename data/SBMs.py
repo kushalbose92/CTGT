@@ -6,12 +6,17 @@ import numpy as np
 
 import dgl
 import torch
+import torch.nn.functional as F
 
 from scipy import sparse as sp
 import numpy as np
 import networkx as nx
 
 import hashlib
+from tqdm import tqdm 
+from scipy.linalg import pinv
+
+
 
 class load_SBMsDataSetDGL(torch.utils.data.Dataset):
 
@@ -34,7 +39,7 @@ class load_SBMsDataSetDGL(torch.utils.data.Dataset):
 
         print("preparing %d graphs for the %s set..." % (self.n_samples, self.split.upper()))
 
-        for data in self.dataset:
+        for data in tqdm(self.dataset):
 
             node_features = data.node_feat
             edge_list = (data.W != 0).nonzero()  # converting adj matrix to edge_list
@@ -53,8 +58,7 @@ class load_SBMsDataSetDGL(torch.utils.data.Dataset):
 
             self.graph_lists.append(g)
             self.node_labels.append(data.node_label)
-
-
+        
     def __len__(self):
         """Return the number of graphs in the dataset."""
         return self.n_samples
@@ -90,8 +94,6 @@ class SBMsDatasetDGL(torch.utils.data.Dataset):
         self.val = load_SBMsDataSetDGL(data_dir, name, split='val')
         print("[I] Finished loading.")
         print("[I] Data load time: {:.4f}s".format(time.time()-start))
-
-
 
 
 def self_loop(g):
@@ -142,80 +144,186 @@ def make_full_graph(g):
     return full_g
     
     
-def laplacian_positional_encoding(g, pos_enc_dim):
+# def laplacian_positional_encoding(g, pos_enc_dim):
+#     """
+#         Graph positional encoding v/ Laplacian eigenvectors
+#     """
+
+#     # Laplacian
+#     # A = g.adjacency_matrix_scipy(return_edge_ids=False).astype(float)
+#     A = g.adj_external(scipy_fmt="csr")
+#     N = sp.diags(dgl.backend.asnumpy(g.in_degrees()).clip(1) ** -0.5, dtype=float)
+#     L = sp.eye(g.number_of_nodes()) - N * A * N
+
+#     # Eigenvectors with scipy
+#     #EigVal, EigVec = sp.linalg.eigs(L, k=pos_enc_dim+1, which='SR')
+#     EigVal, EigVec = sp.linalg.eigs(L, k=pos_enc_dim+1, which='SR', tol=1e-2) # for 40 PEs
+#     EigVec = EigVec[:, EigVal.argsort()] # increasing order
+#     g.ndata['lap_pos_enc'] = torch.from_numpy(EigVec[:,1:pos_enc_dim+1]).float() 
+#     return g
+
+
+
+def laplacian_positional_encoding(g, pos_enc_dim, ctgt_flag):
     """
         Graph positional encoding v/ Laplacian eigenvectors
     """
 
     # Laplacian
-    A = g.adjacency_matrix_scipy(return_edge_ids=False).astype(float)
+    n = g.number_of_nodes()
+    # print("num nodes  ", n)
+    # A = g.adjacency_matrix_scipy(return_edge_ids=False).astype(float)
+    A = g.adj_external(scipy_fmt="csr")
     N = sp.diags(dgl.backend.asnumpy(g.in_degrees()).clip(1) ** -0.5, dtype=float)
     L = sp.eye(g.number_of_nodes()) - N * A * N
 
     # Eigenvectors with scipy
     #EigVal, EigVec = sp.linalg.eigs(L, k=pos_enc_dim+1, which='SR')
-    EigVal, EigVec = sp.linalg.eigs(L, k=pos_enc_dim+1, which='SR', tol=1e-2) # for 40 PEs
-    EigVec = EigVec[:, EigVal.argsort()] # increasing order
-    g.ndata['lap_pos_enc'] = torch.from_numpy(EigVec[:,1:pos_enc_dim+1]).float() 
+    # EigVal, EigVec = sp.linalg.eigs(L, k=pos_enc_dim+1, which='SR', tol=1e-2) # for 40 PEs
+    EigVal, EigVec = np.linalg.eig(L.toarray())
+    # print(n, "  ", EigVal.shape, "  ", EigVec.shape)
+    idx = np.argsort(EigVal)
+    # EigVec = EigVec[:, idx] # increasing order
+    EigVal, EigVec = np.real(EigVal[idx]), np.real(EigVec[:,idx])
+    # print("sum  ", np.round(EigVec.mean(axis=1), 4))
+    # print("aaa  ", EigVec.shape, "    ", EigVal.shape)
+    if ctgt_flag == 'True':
+        EigVal = np.sort(EigVal)
+        EigVal = np.sqrt(EigVal)
+        EigVal = np.where(np.isnan(EigVal), 0, EigVal)
+        EigVal = np.where(EigVal == 0, 1, EigVal)
+        EigVec /= EigVal
+    EigVec = torch.from_numpy(EigVec).to(dtype=torch.float32)
+    EigVec = EigVec[:,1:pos_enc_dim+1]
+    if n <= pos_enc_dim:
+        g.ndata['lap_pos_enc'] = F.pad(EigVec, (0, pos_enc_dim - n + 1), value=float(0))
+    else:
+        g.ndata['lap_pos_enc'] = EigVec
 
+    # print("mean  ", EigVec.shape)
+    # Eigvec = EigVec[:,1:pos_enc_dim]
+    # g.ndata['lap_pos_enc'] = torch.from_numpy(EigVec[:,1:pos_enc_dim+1]).float() 
+    # print(g.ndata['lap_pos_enc'].shape)
+    # exit()
     return g
 
 
-def wl_positional_encoding(g):
+# random walk positional encodings
+def rand_walk_positional_encoding(g, pos_enc_dim):
     """
-        WL-based absolute positional embedding 
-        adapted from 
-        
-        "Graph-Bert: Only Attention is Needed for Learning Graph Representations"
-        Zhang, Jiawei and Zhang, Haopeng and Xia, Congying and Sun, Li, 2020
-        https://github.com/jwzhanggy/Graph-Bert
+        Initializing positional encoding with RWPE
     """
-    max_iter = 2
-    node_color_dict = {}
-    node_neighbor_dict = {}
+    
+    n = g.number_of_nodes()
 
-    edge_list = torch.nonzero(g.adj().to_dense() != 0, as_tuple=False).numpy()
-    node_list = g.nodes().numpy()
+    # Geometric diffusion features with Random Walk
+    # A = g.adjacency_matrix(scipy_fmt="csr")
+    A = g.adj_external(scipy_fmt="csr")
+    Dinv = sp.diags(dgl.backend.asnumpy(g.in_degrees()).clip(1) ** -1.0, dtype=float) # D^-1
+    RW = A * Dinv  
+    M = RW
+    
+    # Iterate
+    nb_pos_enc = pos_enc_dim
+    PE = [torch.from_numpy(M.diagonal()).float()]
+    M_power = M
+    for _ in range(nb_pos_enc-1):
+        M_power = M_power * M
+        PE.append(torch.from_numpy(M_power.diagonal()).float())
+    PE = torch.stack(PE,dim=-1)
+    g.ndata['rw_pos_enc'] = PE  
+    
+    return g
 
-    # setting init
-    for node in node_list:
-        node_color_dict[node] = 1
-        node_neighbor_dict[node] = {}
 
-    for pair in edge_list:
-        u1, u2 = pair
-        if u1 not in node_neighbor_dict:
-            node_neighbor_dict[u1] = {}
-        if u2 not in node_neighbor_dict:
-            node_neighbor_dict[u2] = {}
-        node_neighbor_dict[u1][u2] = 1
-        node_neighbor_dict[u2][u1] = 1
+def node_ordering(g):
+     n = g.number_of_nodes()
+     g.ndata['lap_pos_enc'] = torch.arange(n)
+     return g
 
 
-    # WL recursion
-    iteration_count = 1
-    exit_flag = False
-    while not exit_flag:
-        new_color_dict = {}
-        for node in node_list:
-            neighbors = node_neighbor_dict[node]
-            neighbor_color_list = [node_color_dict[neb] for neb in neighbors]
-            color_string_list = [str(node_color_dict[node])] + sorted([str(color) for color in neighbor_color_list])
-            color_string = "_".join(color_string_list)
-            hash_object = hashlib.md5(color_string.encode())
-            hashing = hash_object.hexdigest()
-            new_color_dict[node] = hashing
-        color_index_dict = {k: v+1 for v, k in enumerate(sorted(set(new_color_dict.values())))}
-        for node in new_color_dict:
-            new_color_dict[node] = color_index_dict[new_color_dict[node]]
-        if node_color_dict == new_color_dict or iteration_count == max_iter:
-            exit_flag = True
+def compute_effective_resistance_matrix(g):
+    """
+    Computing effective resistance for the entire graph
+    """
+
+    nx_g = dgl.to_networkx(g).to_undirected()
+    if not nx.is_connected(nx_g):
+        print("Warning: Graph is disconnected. Resistance only calculated within components.")
+
+    num_edges = g.num_edges()
+    er_values = torch.zeros(num_edges)
+    u, v = g.edges()
+    for i in range(num_edges):
+        src, dst = u[i].item(), v[i].item()
+        if src == dst:
+            er_values[i] = 0.0
         else:
-            node_color_dict = new_color_dict
-        iteration_count += 1
-        
-    g.ndata['wl_pos_enc'] = torch.LongTensor(list(node_color_dict.values()))
+            try:
+                er_values[i] = nx.resistance_distance(nx_g, src, dst)
+            except nx.NetworkXError:
+                er_values[i] = 0.0 
+    g.edata['ER'] = er_values
+
     return g
+ 
+ 
+
+# def wl_positional_encoding(g):
+#     """
+#         WL-based absolute positional embedding 
+#         adapted from 
+        
+#         "Graph-Bert: Only Attention is Needed for Learning Graph Representations"
+#         Zhang, Jiawei and Zhang, Haopeng and Xia, Congying and Sun, Li, 2020
+#         https://github.com/jwzhanggy/Graph-Bert
+#     """
+#     max_iter = 2
+#     node_color_dict = {}
+#     node_neighbor_dict = {}
+
+#     edge_list = torch.nonzero(g.adj().to_dense() != 0, as_tuple=False).numpy()
+#     node_list = g.nodes().numpy()
+
+#     # setting init
+#     for node in node_list:
+#         node_color_dict[node] = 1
+#         node_neighbor_dict[node] = {}
+
+#     for pair in edge_list:
+#         u1, u2 = pair
+#         if u1 not in node_neighbor_dict:
+#             node_neighbor_dict[u1] = {}
+#         if u2 not in node_neighbor_dict:
+#             node_neighbor_dict[u2] = {}
+#         node_neighbor_dict[u1][u2] = 1
+#         node_neighbor_dict[u2][u1] = 1
+
+
+#     # WL recursion
+#     iteration_count = 1
+#     exit_flag = False
+#     while not exit_flag:
+#         new_color_dict = {}
+#         for node in node_list:
+#             neighbors = node_neighbor_dict[node]
+#             neighbor_color_list = [node_color_dict[neb] for neb in neighbors]
+#             color_string_list = [str(node_color_dict[node])] + sorted([str(color) for color in neighbor_color_list])
+#             color_string = "_".join(color_string_list)
+#             hash_object = hashlib.md5(color_string.encode())
+#             hashing = hash_object.hexdigest()
+#             new_color_dict[node] = hashing
+#         color_index_dict = {k: v+1 for v, k in enumerate(sorted(set(new_color_dict.values())))}
+#         for node in new_color_dict:
+#             new_color_dict[node] = color_index_dict[new_color_dict[node]]
+#         if node_color_dict == new_color_dict or iteration_count == max_iter:
+#             exit_flag = True
+#         else:
+#             node_color_dict = new_color_dict
+#         iteration_count += 1
+        
+#     g.ndata['wl_pos_enc'] = torch.LongTensor(list(node_color_dict.values()))
+#     return g
 
     
 class SBMsDataset(torch.utils.data.Dataset):
@@ -244,42 +352,53 @@ class SBMsDataset(torch.utils.data.Dataset):
         graphs, labels = map(list, zip(*samples))
         labels = torch.cat(labels).long()
         batched_graph = dgl.batch(graphs)
-
         return batched_graph, labels
     
     
-    def _add_self_loops(self):
+    # def _add_self_loops(self):
         
-        # function for adding self loops
-        # this function will be called only if self_loop flag is True
+    #     # function for adding self loops
+    #     # this function will be called only if self_loop flag is True
             
-        self.train.graph_lists = [self_loop(g) for g in self.train.graph_lists]
-        self.val.graph_lists = [self_loop(g) for g in self.val.graph_lists]
-        self.test.graph_lists = [self_loop(g) for g in self.test.graph_lists]
+    #     self.train.graph_lists = [self_loop(g) for g in self.train.graph_lists]
+    #     self.val.graph_lists = [self_loop(g) for g in self.val.graph_lists]
+    #     self.test.graph_lists = [self_loop(g) for g in self.test.graph_lists]
         
     def _make_full_graph(self):
         
         # function for converting graphs to full graphs
         # this function will be called only if full_graph flag is True
-        self.train.graph_lists = [make_full_graph(g) for g in self.train.graph_lists]
-        self.val.graph_lists = [make_full_graph(g) for g in self.val.graph_lists]
-        self.test.graph_lists = [make_full_graph(g) for g in self.test.graph_lists]
+        self.train.graph_lists = [make_full_graph(g) for g in tqdm(self.train.graph_lists)]
+        self.val.graph_lists = [make_full_graph(g) for g in tqdm(self.val.graph_lists)]
+        self.test.graph_lists = [make_full_graph(g) for g in tqdm(self.test.graph_lists)]
 
 
-    def _add_laplacian_positional_encodings(self, pos_enc_dim):
+    def _add_laplacian_positional_encodings(self, pos_enc_dim, ctgt_flag):
         
         # Graph positional encoding v/ Laplacian eigenvectors
-        self.train.graph_lists = [laplacian_positional_encoding(g, pos_enc_dim) for g in self.train.graph_lists]
-        self.val.graph_lists = [laplacian_positional_encoding(g, pos_enc_dim) for g in self.val.graph_lists]
-        self.test.graph_lists = [laplacian_positional_encoding(g, pos_enc_dim) for g in self.test.graph_lists]
+        self.train.graph_lists = [laplacian_positional_encoding(g, pos_enc_dim, ctgt_flag) for g in tqdm(self.train.graph_lists)]
+        self.val.graph_lists = [laplacian_positional_encoding(g, pos_enc_dim, ctgt_flag) for g in tqdm(self.val.graph_lists)]
+        self.test.graph_lists = [laplacian_positional_encoding(g, pos_enc_dim, ctgt_flag) for g in tqdm(self.test.graph_lists)]
 
-
-    def _add_wl_positional_encodings(self):
+    def _add_rand_walk_positional_encodings(self, pos_enc_dim):
         
-        # WL positional encoding from Graph-Bert, Zhang et al 2020.
-        self.train.graph_lists = [wl_positional_encoding(g) for g in self.train.graph_lists]
-        self.val.graph_lists = [wl_positional_encoding(g) for g in self.val.graph_lists]
-        self.test.graph_lists = [wl_positional_encoding(g) for g in self.test.graph_lists]
+        # Graph positional encoding v/ Laplacian eigenvectors
+        self.train.graph_lists = [rand_walk_positional_encoding(g, pos_enc_dim) for g in tqdm(self.train.graph_lists)]
+        self.val.graph_lists = [rand_walk_positional_encoding(g, pos_enc_dim) for g in tqdm(self.val.graph_lists)]
+        self.test.graph_lists = [rand_walk_positional_encoding(g, pos_enc_dim) for g in tqdm(self.test.graph_lists)]
+
+    def _add_effective_resistance(self):
+        self.train.graph_lists = [compute_effective_resistance_matrix(g) for g in tqdm(self.train.graph_lists)]
+        self.val.graph_lists = [compute_effective_resistance_matrix(g) for g in tqdm(self.val.graph_lists)]
+        self.test.graph_lists = [compute_effective_resistance_matrix(g) for g in tqdm(self.test.graph_lists)]
+
+
+    # def _add_wl_positional_encodings(self):
+        
+    #     # WL positional encoding from Graph-Bert, Zhang et al 2020.
+    #     self.train.graph_lists = [wl_positional_encoding(g) for g in self.train.graph_lists]
+    #     self.val.graph_lists = [wl_positional_encoding(g) for g in self.val.graph_lists]
+    #     self.test.graph_lists = [wl_positional_encoding(g) for g in self.test.graph_lists]
 
 
 

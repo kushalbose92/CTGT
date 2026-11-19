@@ -19,6 +19,16 @@ def src_dot_dst(src_field, dst_field, out_field):
         return {out_field: (edges.src[src_field] * edges.dst[dst_field]).sum(-1, keepdim=True)}
     return func
 
+def src_dot_src(src_field, out_field):
+    def func(edges):
+        return {out_field: (edges.src[src_field] * edges.src[src_field]).sum(-1, keepdim=True)}
+    return func
+
+def dst_dot_dst(dst_field, out_field):
+    def func(edges):
+        return {out_field: (edges.dst[dst_field] * edges.dst[dst_field]).sum(-1, keepdim=True)}
+    return func
+
 def scaled_exp(field, scale_constant):
     def func(edges):
         # clamp for softmax numerical stability
@@ -46,23 +56,48 @@ class MultiHeadAttentionLayer(nn.Module):
             self.Q = nn.Linear(in_dim, out_dim * num_heads, bias=False)
             self.K = nn.Linear(in_dim, out_dim * num_heads, bias=False)
             self.V = nn.Linear(in_dim, out_dim * num_heads, bias=False)
+
+        # self.rotary_emb = RotaryEmbedding(dim = out_dim * num_heads)
         
     
-    def propagate_attention(self, g):
+    def propagate_attention(self, g, pos_enc, ctgt_flag):
         # Compute attention score
-        g.apply_edges(src_dot_dst('K_h', 'Q_h', 'score')) #, edges)
+        # g.apply_edges(src_dot_dst('K_h', 'Q_h', 'score')) #, edges)
+        # Compute attention score
+        if ctgt_flag == 'True':
+            g.apply_edges(src_dot_dst('K_h', 'Q_h', 'score0')) #, edges)
+            g.apply_edges(src_dot_dst('Q_h', 'K_h', 'score1')) #, edges)
+            g.apply_edges(src_dot_src('Q_h', 'score2'))
+            g.apply_edges(dst_dot_dst('K_h', 'score3'))
+            Z = g.edata['score2'] + g.edata['score3']
+            g.edata['score'] = g.edata['score0'] + g.edata['score1']  - Z
+        else:
+            g.apply_edges(src_dot_dst('K_h', 'Q_h', 'score')) #, edges)
+
+        # g.edata['score'] -= pos_enc
+        # print("attention scores:  ", g.edata['score'].shape)
+
         g.apply_edges(scaled_exp('score', np.sqrt(self.out_dim)))
 
         # Send weighted values to target nodes
         eids = g.edges()
-        g.send_and_recv(eids, fn.src_mul_edge('V_h', 'score', 'V_h'), fn.sum('V_h', 'wV'))
-        g.send_and_recv(eids, fn.copy_edge('score', 'score'), fn.sum('score', 'z'))
+        g.send_and_recv(eids, fn.u_mul_e('V_h', 'score', 'V_h'), fn.sum('V_h', 'wV'))
+        g.send_and_recv(eids, fn.copy_e('score', 'score'), fn.sum('score', 'z'))
+
+        attn_scores = g.edata['score']
+        print("attention scores:  ", attn_scores.shape)
+        return attn_scores
     
-    def forward(self, g, h):
+    def forward(self, g, h, pos_enc, ctgt_flag):
         
         Q_h = self.Q(h)
         K_h = self.K(h)
         V_h = self.V(h)
+
+        if ctgt_flag == 'True':
+            Q_h += pos_enc
+            K_h += pos_enc
+            V_h += pos_enc
         
         # Reshaping into [num_nodes, num_heads, feat_dim] to 
         # get projections for multi-head attention
@@ -70,12 +105,12 @@ class MultiHeadAttentionLayer(nn.Module):
         g.ndata['K_h'] = K_h.view(-1, self.num_heads, self.out_dim)
         g.ndata['V_h'] = V_h.view(-1, self.num_heads, self.out_dim)
         
-        self.propagate_attention(g)
+        attn_scores = self.propagate_attention(g, pos_enc, ctgt_flag)
         
         head_out = g.ndata['wV']/g.ndata['z']
         
-        return head_out
-    
+        return head_out, attn_scores
+
 
 class GraphTransformerLayer(nn.Module):
     """
@@ -112,11 +147,11 @@ class GraphTransformerLayer(nn.Module):
         if self.batch_norm:
             self.batch_norm2 = nn.BatchNorm1d(out_dim)
         
-    def forward(self, g, h):
+    def forward(self, g, h, pos_enc, ctgt_flag):
         h_in1 = h # for first residual connection
         
         # multi-head attention out
-        attn_out = self.attention(g, h)
+        attn_out, attn_scores = self.attention(g, h, pos_enc, ctgt_flag)
         h = attn_out.view(-1, self.out_channels)
         
         h = F.dropout(h, self.dropout, training=self.training)
@@ -149,7 +184,7 @@ class GraphTransformerLayer(nn.Module):
         if self.batch_norm:
             h = self.batch_norm2(h)       
 
-        return h
+        return h, attn_scores
         
     def __repr__(self):
         return '{}(in_channels={}, out_channels={}, heads={}, residual={})'.format(self.__class__.__name__,

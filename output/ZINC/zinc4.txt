@@ -1,0 +1,11 @@
+41    True    True
+cuda not available
+[I] Loading dataset ZINC...
+[I] Finished loading.
+[I] Data load time: 1.7037s
+MODEL DETAILS:
+
+MODEL/Total parameters: GraphTransformer 589505
+[!] Adding Laplacian positional encoding.
+Time LapPE: 4.336391925811768
+[!] Converting the given graphs to full graphs..

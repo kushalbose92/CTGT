@@ -55,12 +55,6 @@ def gpu_setup(use_gpu, gpu_id):
 
 
 
-
-
-
-
-
-
 """
     VIEWING MODEL CONFIG AND PARAMS
 """
@@ -90,20 +84,30 @@ def train_val_pipeline(MODEL_NAME, dataset, params, net_params, dirs):
     if net_params['lap_pos_enc']:
         st = time.time()
         print("[!] Adding Laplacian positional encoding.")
-        dataset._add_laplacian_positional_encodings(net_params['pos_enc_dim'])
+        dataset._add_laplacian_positional_encodings(net_params['pos_enc_dim'], net_params['ctgt_flag'])
+        # dataset._add_node_ordering()
         print('Time LapPE:',time.time()-st)
-        
-    if net_params['wl_pos_enc']:
+
+    if net_params['rw_pos_enc']:
         st = time.time()
-        print("[!] Adding WL positional encoding.")
-        dataset._add_wl_positional_encodings()
+        print("[!] Adding RW positional encoding.")
+        dataset._add_rand_walk_positional_encodings(net_params['pos_enc_dim'])
         print('Time WL PE:',time.time()-st)
     
-    if net_params['full_graph']:
+    if net_params['full_graph'] == 'True':
         st = time.time()
         print("[!] Converting the given graphs to full graphs..")
         dataset._make_full_graph()
         print('Time taken to convert to full graphs:',time.time()-st)    
+
+    if net_params['eff_res']:
+        st = time.time()
+        print("[!] Computing Effective Resistance.")
+        dataset._add_effective_resistance()
+        # dataset._add_node_ordering()
+        print('Time ER:',time.time()-st)
+        
+    # print("{} || {} || {}".format(net_params['pe_layers'], net_params['manifold'], net_params['model']))
         
     trainset, valset, testset = dataset.train, dataset.val, dataset.test
         
@@ -117,16 +121,24 @@ def train_val_pipeline(MODEL_NAME, dataset, params, net_params, dirs):
     log_dir = os.path.join(root_log_dir, "RUN_" + str(0))
     writer = SummaryWriter(log_dir=log_dir)
 
+
     # setting seeds
     random.seed(params['seed'])
     np.random.seed(params['seed'])
     torch.manual_seed(params['seed'])
-    if device.type == 'cuda':
+    if device == 'cuda:0':
         torch.cuda.manual_seed(params['seed'])
+        torch.cuda.manual_seed_all(params['seed'])
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
     
     print("Training Graphs: ", len(trainset))
     print("Validation Graphs: ", len(valset))
     print("Test Graphs: ", len(testset))
+    
+    print("---------------------------------------------")
+    
 
     model = gnn_model(MODEL_NAME, net_params)
     model = model.to(device)
@@ -134,8 +146,7 @@ def train_val_pipeline(MODEL_NAME, dataset, params, net_params, dirs):
     optimizer = optim.Adam(model.parameters(), lr=params['init_lr'], weight_decay=params['weight_decay'])
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',
                                                      factor=params['lr_reduce_factor'],
-                                                     patience=params['lr_schedule_patience'],
-                                                     verbose=True)
+                                                     patience=params['lr_schedule_patience'])
     
     epoch_train_losses, epoch_val_losses = [], []
     epoch_train_MAEs, epoch_val_MAEs = [], [] 
@@ -157,10 +168,10 @@ def train_val_pipeline(MODEL_NAME, dataset, params, net_params, dirs):
 
                 start = time.time()
 
-                epoch_train_loss, epoch_train_mae, optimizer = train_epoch(model, optimizer, device, train_loader, epoch)
+                epoch_train_loss, epoch_train_mae, optimizer = train_epoch(model, optimizer, device, train_loader, net_params)
                     
-                epoch_val_loss, epoch_val_mae = evaluate_network(model, device, val_loader, epoch)
-                _, epoch_test_mae = evaluate_network(model, device, test_loader, epoch)
+                epoch_val_loss, epoch_val_mae = evaluate_network(model, device, val_loader, net_params)
+                _, epoch_test_mae = evaluate_network(model, device, test_loader, net_params)
                 
                 epoch_train_losses.append(epoch_train_loss)
                 epoch_val_losses.append(epoch_val_loss)
@@ -212,9 +223,13 @@ def train_val_pipeline(MODEL_NAME, dataset, params, net_params, dirs):
         print('-' * 89)
         print('Exiting from training early because of KeyboardInterrupt')
     
-    _, test_mae = evaluate_network(model, device, test_loader, epoch)
-    _, train_mae = evaluate_network(model, device, train_loader, epoch)
-    print("Test MAE: {:.4f}".format(test_mae))
+    test_mae_list = []
+    test_loader_new = DataLoader(testset, batch_size=params['batch_size'], shuffle=True, collate_fn=dataset.collate)
+    for p in range(10):
+        _, test_mae = evaluate_network(model, device, test_loader_new, net_params)
+        _, train_mae = evaluate_network(model, device, train_loader, net_params)
+        test_mae_list.append(test_mae)
+    print("Test MAE Stats: {:.4f} || {:.4f}".format(np.mean(test_mae_list), np.std(test_mae_list)))
     print("Train MAE: {:.4f}".format(train_mae))
     print("Convergence Time (Epochs): {:.4f}".format(epoch))
     print("TOTAL TIME TAKEN: {:.4f}s".format(time.time()-t0))
@@ -273,7 +288,18 @@ def main():
     parser.add_argument('--pos_enc_dim', help="Please give a value for pos_enc_dim")
     parser.add_argument('--lap_pos_enc', help="Please give a value for lap_pos_enc")
     parser.add_argument('--wl_pos_enc', help="Please give a value for wl_pos_enc")
+    parser.add_argument('--rw_pos_enc', help="Please give a value for rw_pos_enc")
+    parser.add_argument('--full_graph', help="Whether to convert to full graphs")
+    parser.add_argument('--ctgt_flag', help="Whether to activate CTGT")
+    
     args = parser.parse_args()
+    rand_seed = args.seed 
+    full_graph = args.full_graph
+    ctgt_flag = args.ctgt_flag
+    print(rand_seed, "  ", full_graph, "  ", ctgt_flag)
+
+    args.config = 'configs/' + args.config
+
     with open(args.config) as f:
         config = json.load(f)
         
@@ -298,8 +324,9 @@ def main():
         out_dir = config['out_dir']
     # parameters
     params = config['params']
-    if args.seed is not None:
-        params['seed'] = int(args.seed)
+    params['seed'] = int(rand_seed)
+    # if args.seed is not None:
+        # params['seed'] = int(args.seed)
     if args.epochs is not None:
         params['epochs'] = int(args.epochs)
     if args.batch_size is not None:
@@ -320,6 +347,11 @@ def main():
         params['max_time'] = float(args.max_time)
     # network parameters
     net_params = config['net_params']
+    net_params['full_graph'] = full_graph
+    net_params['ctgt_flag'] = ctgt_flag
+    # print("full ", net_params['full_graph'])
+    # print("flag  ", net_params['ctgt_flag'])
+    # exit()
     net_params['device'] = device
     net_params['gpu_id'] = config['gpu']['id']
     net_params['batch_size'] = params['batch_size']
@@ -348,11 +380,13 @@ def main():
     if args.self_loop is not None:
         net_params['self_loop'] = True if args.self_loop=='True' else False
     if args.lap_pos_enc is not None:
-        net_params['lap_pos_enc'] = True if args.pos_enc=='True' else False
+        net_params['lap_pos_enc'] = True if args.lap_pos_enc=='True' else False
     if args.pos_enc_dim is not None:
         net_params['pos_enc_dim'] = int(args.pos_enc_dim)
     if args.wl_pos_enc is not None:
-        net_params['wl_pos_enc'] = True if args.pos_enc=='True' else False
+        net_params['wl_pos_enc'] = True if args.wl_pos_enc=='True' else False
+    if args.rw_pos_enc is not None:
+        net_params['rw_pos_enc'] = True if args.rw_pos_enc== 'True' else False
         
     
     # ZINC

@@ -1,0 +1,10 @@
+LRGB has five datasets
+
+COCO-SP and PASCALVOC_SP are two super-pixels daatsets 
+Task: Node classification
+
+data/superpixels.py ----  
+
+prepare_PASCALVOC-SP.py, prepare_COCO-SP.py ---- 
+
+main_lrgb_node_classification.py ---- 
