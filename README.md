@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 
 
 # Graph Transformer Architecture
@@ -60,3 +61,6 @@ This project is based on the [benchmarking-gnns](https://github.com/graphdeeplea
 
 <br><br><br>
 
+=======
+# Commute Time Graph Transformer (CTGT)
+>>>>>>> 0f1d6ca97736f3e8c5e89d2a12fbc6dab7b4a3b9
